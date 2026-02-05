@@ -9,7 +9,7 @@ def worker(rank, world_size):
     os.environ["MASTER_PORT"] = "29501"
 
     dist.init_process_group(
-        backend="gloo",      # Communication backend
+        backend="nccl",      # Communication backend
         init_method="env://",# Use env vars for rendezvous
         world_size=world_size,
         rank=rank
@@ -18,7 +18,7 @@ def worker(rank, world_size):
     dist.destroy_process_group()
 
 if __name__ == "__main__":
-    world_size = 4
+    world_size = 8
     mp.spawn(worker, args=(world_size,), nprocs=world_size)
 
 # mp.spawn():
