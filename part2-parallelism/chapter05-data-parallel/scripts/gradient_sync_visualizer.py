@@ -69,8 +69,11 @@ def visualize_sync(rank: int, world_size: int, verbose: bool) -> None:
     model = TinyModel().to(device)
 
     # Broadcast weights to ensure identical starting point
-    for param in model.parameters():
-        dist.broadcast(param, src=0)
+    # NOTE: dist.broadcast writes into each param in place, and these param require grad (model params)
+    # Pytorch forbids in-place ops on such tensors, so we need to use torch.no_grad() to avoid this.
+    with torch.no_grad():
+        for param in model.parameters():
+            dist.broadcast(param, src=0)
 
     dist.barrier()
 
