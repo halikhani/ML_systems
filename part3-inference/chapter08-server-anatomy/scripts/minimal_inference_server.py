@@ -284,4 +284,109 @@ class InferenceServer:
 
 
 
+async def run_demo(num_requests: int, max_batch_size: int):
+    """Run a demonstration of the inference server."""
+    print("=" * 60)
+    print(" MINIMAL INFERENCE SERVER DEMO")
+    print("=" * 60)
 
+    server = InferenceServer(max_batch_size=max_batch_size)
+
+    # Sample prompts
+    prompts = [
+        "What is the capital of France?",
+        "Explain quantum computing in simple terms.",
+        "Write a haiku about programming.",
+        "What is machine learning?",
+        "Tell me a joke.",
+        "How does the internet work?",
+        "What is the meaning of life?",
+        "Describe a beautiful sunset.",
+    ]
+
+    print(f"\nConfiguration:")
+    print(f"  Max batch size: {max_batch_size}")
+    print(f"  Number of requests: {num_requests}")
+    print(f"\n{'─' * 60}\n")
+
+    # Submit requests
+    requests = []
+    for i in range(num_requests):
+        prompt = prompts[i % len(prompts)]
+        request = await server.generate(prompt, max_tokens=20)
+        requests.append(request)
+
+    
+    print(f"\n{'─' * 60}\n")
+    print("Processing requests...\n")
+
+    # Process all requests
+    start_time = time.time()
+    await server.run_until_complete()
+    total_time = time.time() - start_time
+
+
+    # Print results
+    print(f"\n{'─' * 60}")
+    print(" RESULTS")
+    print(f"{'─' * 60}\n")
+
+    total_tokens = 0
+    for req in server.scheduler.completed:
+        latency = time.time() - req.created_at
+        print(f"Request {req.id}: {len(req.generated_tokens)} tokens, "
+              f"{latency:.3f}s latency")
+        total_tokens += len(req.generated_tokens)
+
+
+    print(f"\n{'─' * 60}")
+    print(" SUMMARY")
+    print(f"{'─' * 60}")
+    print(f"Total requests: {num_requests}")
+    print(f"Total tokens generated: {total_tokens}")
+    print(f"Total time: {total_time:.3f}s")
+    print(f"Throughput: {total_tokens / total_time:.1f} tokens/second")
+
+
+    # Explain what's happening
+    print(f"\n{'─' * 60}")
+    print(" WHAT THIS DEMONSTRATES")
+    print(f"{'─' * 60}")
+    print("""
+1. REQUEST FLOW:
+   Prompt → Tokenizer → Scheduler → Model Runner → Response
+
+2. PREFILL vs DECODE:
+   - Prefill: Process entire prompt (one request at a time here)
+   - Decode: Generate tokens in batches
+
+3. BATCHING:
+   - Multiple requests share GPU compute during decode
+   - Higher batch size → higher throughput but higher latency
+
+4. CONTINUOUS BATCHING (simplified):
+   - New requests can start prefill while others decode
+   - Finished requests exit, making room for new ones
+
+5. LIMITATIONS OF THIS DEMO:
+   - No actual model (just simulated delays)
+   - No KV cache management
+   - No memory management
+   - No streaming output
+   - Simplified scheduling logic
+""")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Minimal Inference Server Demo")
+    parser.add_argument("--num-requests", "-n", type=int, default=5,
+                        help="Number of requests to process")
+    parser.add_argument("--batch-size", "-b", type=int, default=4,
+                        help="Maximum batch size")
+    args = parser.parse_args()
+
+    asyncio.run(run_demo(args.num_requests, args.batch_size))
+
+
+if __name__ == "__main__":
+    main()
