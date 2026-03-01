@@ -211,3 +211,77 @@ class Scheduler:
         return bool(self.waiting_queue or self.running_batch)
 
 
+
+class InferenceServer:
+    """
+    Main inference server orchestrating all components.
+    """
+
+    def __init__(self, max_batch_size: int = 4):
+        self.tokenizer = SimpleTokenizer()
+        self.model_runner = SimpleModelRunner()
+        self.scheduler = Scheduler(max_batch_size=max_batch_size)
+        self.request_counter = 0
+
+    
+    async def generate(self, prompt: str, max_tokens: int = 50) -> GenerateRequest:
+        """Submit a generation request."""
+        # NOTE: generate() can be called from an async server 
+        # (e.g., handling multiple concurrent requests) without blocking; it returns quickly after enqueueing work.
+        # tokenize
+        tokens = self.tokenizer.encode(prompt)
+
+        # create request
+        request = GenerateRequest(
+            id=self.request_counter,
+            prompt=prompt,
+            prompt_tokens=tokens,
+            max_tokens=max_tokens,
+        )
+        self.request_counter += 1
+
+        # submit to scheduler
+        self.scheduler.add_request(request)
+        return request
+
+
+    async def run_step(self):
+        """Run one step of inference."""
+        # NOTE: run_step() awaits model_runner.prefill/decode, 
+        # which likely represent I/O-bound or long-running compute. 
+        # Making these awaitable lets the event loop interleave other tasks 
+        # (like accepting new requests or handling responses) while a step runs.
+        batch = self.scheduler.get_next_batch()
+        if batch is None:
+            return False
+
+        if batch.is_prefill:
+            # Prefill phase
+            request = batch.requests[0]
+            print(f"[Server] Prefill request {request.id} "
+                  f"({len(request.prompt_tokens)} prompt tokens)")
+            
+            tokens = await self.model_runner.prefill(request)
+            self.scheduler.process_decode_result(request, tokens)
+
+        else:
+            # Decode phase
+            print(f"[Server] Decode batch of {len(batch.requests)} requests")
+
+            tokens = await self.model_runner.decode(batch.requests)
+            for request, token in zip(batch.requests, tokens):
+                self.scheduler.process_decode_result(request, token)
+
+        return True
+
+
+    async def run_until_complete(self):
+        """Run until all requests are complete."""
+        # NOTE: run_until_complete() awaits each step so the loop cooperates 
+        # with the event loop rather than busy-waiting.
+        while self.scheduler.has_work():
+            await self.run_step()
+
+
+
+
