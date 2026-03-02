@@ -178,3 +178,175 @@ def compare_fragmentation(model: ModelConfig, requests: int,
     }
 
 
+def print_model_comparison():
+    """Print KV cache comparison for common models."""
+    print("=" * 70)
+    print(" KV CACHE SIZE COMPARISON ACROSS MODELS")
+    print("=" * 70)
+
+    context_lengths = [2048, 4096, 8192, 32768, 131072]
+
+    print(f"\n{'Model':<15} {'Layers':<8} {'KV Heads':<10} "
+          f"{'Per Token':<12} {'@ 8K ctx':<12} {'@ 32K ctx':<12}")
+    print("-" * 70)
+
+
+    for name, model in MODELS.items():
+        results = calculate_kv_cache(model, context_lengths)
+        per_token = format_bytes(results['kv_bytes_per_token'])
+        at_8k = results['contexts'][8192]['per_request_formatted']
+        at_32k = results['contexts'][32768]['per_request_formatted']
+
+        print(f"{model.name:<15} {model.num_layers:<8} {model.num_kv_heads:<10} "
+              f"{per_token:<12} {at_8k:<12} {at_32k:<12}")
+
+
+def print_capacity_analysis(model_name: str, gpu_config: str):
+    """Print capacity analysis for a specific configuration."""
+    model = MODELS.get(model_name.lower())
+    if not model:
+        print(f"Unknown model: {model_name}")
+        return
+
+    # GPU configurations
+    gpu_configs = {
+        "h100": (80, "H100 80GB"),
+        "a100": (80, "A100 80GB"),
+        "a100-40": (40, "A100 40GB"),
+        "4090": (24, "RTX 4090 24GB"),
+    }
+
+    # Model sizes (approximate, FP16)
+    model_sizes = {
+        "llama-7b": 14,
+        "llama-13b": 26,
+        "llama-70b": 140,
+        "mistral-7b": 14,
+        "qwen-72b": 144,
+        "deepseek-67b": 134,
+    }
+
+    gpu_memory, gpu_name = gpu_configs.get(gpu_config, (80, "Custom"))
+    model_size = model_sizes.get(model_name.lower(), 14)
+
+    print("\n" + "=" * 70)
+    print(f" CAPACITY ANALYSIS: {model.name} on {gpu_name}")
+    print("=" * 70)
+
+    for context_len in [2048, 4096, 8192, 32768]:
+        capacity = analyze_capacity(model, gpu_memory, model_size, context_len)
+
+        if 'error' in capacity:
+            print(f"\n@ {context_len} context: {capacity['error']}")
+            continue
+
+        print(f"\n@ {context_len} context length:")
+        print(f"  Available for KV cache: {capacity['available_for_kv_gb']:.1f} GB")
+        print(f"  KV per request: {capacity['kv_per_request_gb']:.2f} GB")
+        print(f"  Without PagedAttention: ~{capacity['requests_without_paging']} concurrent requests")
+        print(f"  With PagedAttention: ~{capacity['requests_with_paging']} concurrent requests")
+        print(f"  Improvement: {capacity['paging_improvement']}")
+
+
+def print_fragmentation_analysis(model_name: str):
+    """Show memory fragmentation with and without paging."""
+    model = MODELS.get(model_name.lower())
+    if not model:
+        print(f"Unknown model: {model_name}")
+        return
+
+    print("\n" + "=" * 70)
+    print(f" FRAGMENTATION ANALYSIS: {model.name}")
+    print("=" * 70)
+
+    scenarios = [
+        (100, 512, 8192, "Short prompts, 8K max"),
+        (50, 2048, 8192, "Medium prompts, 8K max"),
+        (20, 4096, 32768, "Long prompts, 32K max"),
+        (10, 8192, 131072, "Very long, 128K max"),
+    ]
+
+    for requests, avg_ctx, max_ctx, desc in scenarios:
+        frag = compare_fragmentation(model, requests, avg_ctx, max_ctx)
+
+        print(f"\nScenario: {desc}")
+        print(f"  Requests: {requests}, Avg context: {avg_ctx}, Max context: {max_ctx}")
+        print(f"  Without paging: {frag['memory_without_paging']}")
+        print(f"  With paging: {frag['memory_with_paging']}")
+        print(f"  Memory saved: {frag['memory_wasted']} ({frag['waste_percentage']} reduction)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="KV Cache Calculator")
+    parser.add_argument("--model", "-m", type=str, default="llama-70b",
+                        choices=list(MODELS.keys()),
+                        help="Model to analyze")
+    parser.add_argument("--gpu", "-g", type=str, default="h100",
+                        choices=["h100", "a100", "a100-40", "4090"],
+                        help="GPU type")
+    parser.add_argument("--custom", action="store_true",
+                        help="Use custom model config")
+    parser.add_argument("--layers", type=int, default=80,
+                        help="Number of layers (with --custom)")
+    parser.add_argument("--heads", type=int, default=8,
+                        help="Number of KV heads (with --custom)")
+    parser.add_argument("--dim", type=int, default=128,
+                        help="Head dimension (with --custom)")
+    args = parser.parse_args()
+
+    print("╔" + "═" * 68 + "╗")
+    print("║" + " KV CACHE CALCULATOR".center(68) + "║")
+    print("╚" + "═" * 68 + "╝")
+
+    if args.custom:
+        custom_model = ModelConfig(
+            "Custom",
+            num_layers=args.layers,
+            num_kv_heads=args.heads,
+            head_dim=args.dim
+        )
+        MODELS["custom"] = custom_model
+        args.model = "custom"
+
+
+    # Model comparison
+    print_model_comparison()
+
+    # Capacity analysis
+    print_capacity_analysis(args.model, args.gpu)
+
+    # Fragmentation analysis
+    print_fragmentation_analysis(args.model)
+
+    # Key insights
+    print("\n" + "=" * 70)
+    print(" KEY INSIGHTS")
+    print("=" * 70)
+    print("""
+1. KV CACHE DOMINATES MEMORY
+   - For long contexts, KV cache >> model weights
+   - 70B model @ 32K context: 140GB weights vs ~10GB KV per request
+
+2. GQA DRAMATICALLY REDUCES KV CACHE
+   - LLaMA-70B uses 8 KV heads (vs 64 attention heads)
+   - 8x smaller KV cache per token!
+
+3. PAGEDATTENTION NEARLY DOUBLES CAPACITY
+   - Eliminates internal fragmentation
+   - 95% utilization vs ~50% without paging
+
+4. CONTEXT LENGTH IS THE KILLER
+   - 32K context: ~47 concurrent requests
+   - 128K context: ~12 concurrent requests
+   - Same GPU, same model!
+
+5. QUANTIZED KV CACHE HELPS
+   - FP8 KV cache: 2x more requests
+   - INT8 KV cache: similar benefits
+   - Some quality trade-off
+""")
+
+
+if __name__ == "__main__":
+    main()
+
