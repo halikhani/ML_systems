@@ -92,13 +92,13 @@ def run_with_cuda():
 
     
     # warmpup for capture
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
+    s = torch.cuda.Stream() # Creates a new CUDA stream s so warmup runs separately from the default stream.
+    s.wait_stream(torch.cuda.current_stream()) # Makes s wait for any pending work on the current (default) stream.
     with torch.cuda.stream(s):
         for _ in range(3):
             with torch.no_grad():
                 static_output = model(static_input)
-    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.current_stream().wait_stream(s) # Makes the current stream wait until s finishes, so later capture starts only after warmup is done.
 
     # capture the graph
     graph = torch.cuda.CUDAGraph()
