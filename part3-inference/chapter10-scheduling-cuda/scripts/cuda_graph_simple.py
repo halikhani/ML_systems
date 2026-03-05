@@ -90,6 +90,11 @@ def run_with_cuda():
     static_input = torch.randn(batch_size, 512, device='cuda')
     static_output = torch.zeros(batch_size, 512, device='cuda')
 
+    #NOTE: A CUDA stream is a sequence of GPU operations that execute in order on the same stream, 
+    # but can run concurrently with work in other streams if the GPU has resources. 
+    # Think of streams as independent command queues: 
+    #   - operations in one stream are serialized; 
+    #   - operations across different streams can overlap (e.g., compute + data transfer) unless you add explicit synchronization.
     
     # warmpup for capture
     s = torch.cuda.Stream() # Creates a new CUDA stream s so warmup runs separately from the default stream.
