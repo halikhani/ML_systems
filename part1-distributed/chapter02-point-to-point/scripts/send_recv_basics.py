@@ -70,54 +70,44 @@ def chain_worker(rank: int, world_size: int, backend: str) -> None:
 
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
-    # get device
+    # Get device (CPU for gloo, GPU for nccl)
     device = torch.device("cpu")
     if backend == "nccl" and torch.cuda.is_available():
         local_rank = rank % torch.cuda.device_count()
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
 
-    # =========================================================================
-    # The Chain Pattern
-    # =========================================================================
-    # This pattern naturally avoids deadlocks because:
-    # - Rank 0 only sends (no one sends to it first)
-    # - Middle ranks receive then send (in that order)
-    # - Last rank only receives (no one receives from it)
-
     if rank == 0:
-        # first process, create the init tensor and send
         tensor = torch.tensor([42.0], device=device)
         print(f"[Rank 0] Starting chain with value: {tensor.item()}")
         dist.send(tensor, dst=1)
-        print(f"[Rank 0] Sent tensor to rank 1")
+        print(f"[Rank 0] Sent to rank 1")
 
-    elif rank == world_size - 1:
-        # last process, receive and display the result
+    elif rank == world_size - 1 :
         tensor = torch.zeros(1, device=device)
         dist.recv(tensor, src=rank - 1)
         print(f"[Rank {rank}] Received final value: {tensor.item()}")
         print(f"\n{'='*50}")
         print(f"Chain complete!")
         print(f"Original: 42.0")
-        print(f"After {world_size - 1} additions of 10: {tensor.item()}")
-        print(f"Expected: {42.0 + (world_size - 1) * 10}")
+        print(f"After {world_size - 2} additions of 10: {tensor.item()}")
+        print(f"Expected: {42.0 + (world_size - 2) * 10}")
         print(f"{'='*50}")
-    
+
     else:
-        # middle process, receive, add 10, and send
+        # middle ranks
         tensor = torch.zeros(1, device=device)
         dist.recv(tensor, src=rank - 1)
         print(f"[Rank {rank}] Received: {tensor.item()}")
-
         tensor += 10.0
         print(f"[Rank {rank}] After adding 10: {tensor.item()}")
-        dist.send(tensor, dst=rank + 1)
+        dist.send(tensor, dst = rank + 1)
         print(f"[Rank {rank}] Sent to rank {rank + 1}")
 
-    # synchronize all processes
+    # Synchronize all processes before cleanup
     dist.barrier()
     dist.destroy_process_group()
+
 
 
 def demonstrate_deadlock_pattern():
