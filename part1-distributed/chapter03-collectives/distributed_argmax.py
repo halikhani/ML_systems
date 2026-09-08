@@ -7,7 +7,7 @@ import torch.multiprocessing as mp
 
 
 
-def compute_argmax(rank: int, world_size: int, device: torch.device) -> torch.Tensor:
+def compute_argmax(rank: int, world_size: int, device: torch.device) -> None:
 
 
     # first find the global argmax

@@ -144,11 +144,11 @@ def demo_all_gather(rank: int, world_size: int, device: torch.device) -> None:
     """
     # Each rank has unique data
     tensor = torch.tensor([rank * 10.0, rank * 100.0], device=device)
-    print_state(rank, world_size, "GATHER (dst=0)", tensor, is_before=True)
+    print_state(rank, world_size, "ALL GATHER (dst=0)", tensor, is_before=True)
     # gather from all processes to all ranks
     gather_list = [torch.zeros(2, device=device) for i in range(world_size)]
     dist.all_gather(gather_list, tensor)
-    print_state(rank, world_size, "GATHER (dst=0)", torch.stack(gather_list), is_before=False)
+    print_state(rank, world_size, "ALL GATHER (dst=0)", torch.stack(gather_list), is_before=False)
     if rank == 0:
         print("\n[Explanation] Every rank now has [1, 2, 3, 4] (data from all ranks).")
 
