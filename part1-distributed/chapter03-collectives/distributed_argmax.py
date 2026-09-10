@@ -9,7 +9,6 @@ import torch.multiprocessing as mp
 
 def compute_argmax(rank: int, world_size: int, device: torch.device) -> None:
 
-
     # first find the global argmax
     local_tensor = torch.tensor([rank + 1], device=device)
     print(f"Rank {rank} local tensor: {local_tensor.item()}")

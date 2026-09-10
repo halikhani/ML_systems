@@ -1,119 +1,121 @@
 """
 NCCL Algorithm Benchmark
 
-This script benchmarks all_reduce performance with different:
-- Message sizes (small vs large)
+Benchmarks all_reduce performance across:
+- Message sizes
 - Number of processes
-- Backend settings
+- Backend (Gloo or NCCL)
+- NCCL algorithm selection (Auto, Ring, or Tree)
 
-It demonstrates how performance characteristics change based on
-these parameters, showing when Ring vs Tree algorithms excel.
-
-Usage:
+Examples:
     python benchmark_algorithms.py
-    python benchmark_algorithms.py --sizes 1000,1000000,100000000
 
-Note: On CPU-only systems, this uses the gloo backend which
-doesn't have Ring/Tree algorithm selection, but still demonstrates
-how message size affects throughput.
+    python benchmark_algorithms.py \
+        --backend nccl \
+        --world-size 4 \
+        --algorithm ring
 
-example output:
-=== All-Reduce Benchmark ===
+    python benchmark_algorithms.py \
+        --backend nccl \
+        --world-size 4 \
+        --algorithm tree \
+        --sizes 1024,16384,262144,4194304,67108864
 
-Message Size | Latency (ms) | Throughput (GB/s) | Algorithm
--------------|--------------|-------------------|----------
-     1 KB    |     0.05     |       0.02        |   Tree
-    16 KB    |     0.06     |       0.27        |   Tree
-   256 KB    |     0.12     |       2.13        |   Ring
-     4 MB    |     0.89     |       4.49        |   Ring
-    64 MB    |    12.50     |       5.12        |   Ring
-     1 GB    |   198.00     |       5.05        |   Ring
-
-Observations:
-- Tree wins for small messages (< 256 KB): lower latency
-- Ring wins for large messages (> 256 KB): better bandwidth
-- Peak throughput: 5.12 GB/s (limited by PCIe)
-
-
-Interpreting Results
-
-Latency-bound (small messages):
-
-Tree algorithm is better
-Dominated by startup overhead
-Actual data transfer is fast
-Bandwidth-bound (large messages):
-
-Ring algorithm is better
-Near-100% bandwidth utilization
-All GPUs sending/receiving simultaneously
-
+Notes:
+- NCCL requires CUDA GPUs.
+- Gloo does not expose NCCL Ring/Tree algorithm selection.
+- Tree often performs better for small latency-bound messages.
+- Ring often performs better for sufficiently large bandwidth-bound messages.
+- The crossover point depends on GPU count, topology, NCCL version,
+  message size, protocol, and hardware.
 """
-
 
 import argparse
 import os
 import time
-from typing import List, Dict
+from typing import Dict, List
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def format_bytes(size: int) -> str:
-    """Format bytes into human-readable format."""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size < 1024:
-            return f"{size:.1f}, {unit}"
+def format_bytes(size: float) -> str:
+    """Format a byte count into human-readable form."""
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}"
         size /= 1024
+
     return f"{size:.1f} TB"
 
 
 def format_bandwidth(bytes_per_sec: float) -> str:
-    """Format bandwidth into human-readable string."""
-    return format_bytes(int(bytes_per_sec)) + "/s"
+    """Format bandwidth into human-readable form."""
+    return format_bytes(bytes_per_sec) + "/s"
 
 
 def benchmark_all_reduce(
     tensor: torch.Tensor,
-    num_iterations: int = 1000,
+    num_iterations: int = 50,
     warmup_iterations: int = 10,
-) -> Dict:
+) -> Dict[str, float]:
     """
-    Benchmark all_reduce operation.
+    Benchmark synchronous completion latency of all_reduce.
 
-    Returns dict with timing statistics.
+    With CUDA, time.perf_counter() is paired with cuda.synchronize()
+    so that the CPU timer includes actual GPU-side collective completion.
     """
-    # warmup
+
+    # Warmup
     for _ in range(warmup_iterations):
-        dist.all_reduce(tensor.clone())
+        dist.all_reduce(tensor)
 
-    # Synchronize before timing
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+
+    # Align all ranks before beginning the timed experiment.
     dist.barrier()
 
-    # Benchmark
     times = []
-    for _ in range(num_iterations):
-        test_tensor = tensor.clone()
-        start_time = time.perf_counter()
-        dist.all_reduce(test_tensor)
-        dist.barrier()
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    for _ in range(num_iterations):
+        # Ensure no previously queued CUDA work leaks into this iteration.
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+
+        start_time = time.perf_counter()
+
+        dist.all_reduce(tensor)
+
+        # all_reduce on CUDA is asynchronous with respect to the CPU,
+        # so wait for GPU-side completion before stopping the timer.
+        if tensor.is_cuda:
+            torch.cuda.synchronize(tensor.device)
+
         end_time = time.perf_counter()
         times.append(end_time - start_time)
 
+    sorted_times = sorted(times)
+
     return {
-        'mean_ms': sum(times) / len(times) * 1000,
-        'min_ms': min(times) * 1000,
-        'max_ms': max(times) * 1000,
-        'median_ms': sorted(times)[len(times)//2] * 1000,
+        "mean_ms": sum(times) / len(times) * 1000,
+        "min_ms": min(times) * 1000,
+        "max_ms": max(times) * 1000,
+        "median_ms": sorted_times[len(sorted_times) // 2] * 1000,
     }
-    
+
+
+def reduce_max_across_ranks(value: float, device: torch.device) -> float:
+    """
+    Return the maximum scalar value observed across ranks.
+
+    For distributed latency, the slowest rank is often the most useful
+    summary because the collective is constrained by its slowest participant.
+    """
+    t = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
 
 
 def benchmark_worker(
@@ -121,176 +123,328 @@ def benchmark_worker(
     world_size: int,
     message_sizes: List[int],
     backend: str,
-    num_iterations: int = 1000,
+    num_iterations: int,
+    algorithm: str,
 ) -> None:
-    """Worker function for benchmarking."""
+    """Worker function run by each distributed process."""
 
-    # set env vars
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29508"
 
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    # NCCL_ALGO must be configured before process-group initialization.
+    if backend == "nccl":
+        if algorithm == "ring":
+            os.environ["NCCL_ALGO"] = "Ring"
+        elif algorithm == "tree":
+            os.environ["NCCL_ALGO"] = "Tree"
+        else:
+            # Ensure --algorithm auto is truly automatic even if the shell
+            # already has NCCL_ALGO configured.
+            os.environ.pop("NCCL_ALGO", None)
+
+    dist.init_process_group(
+        backend=backend,
+        rank=rank,
+        world_size=world_size,
+    )
 
     device = torch.device("cpu")
-    if backend == "nccl" and torch.cuda.is_available():
-        local_rank = rank % torch.cuda.device_count()
-        device = torch.device(f"cuda:{local_rank}")
+
+    if backend == "nccl":
+        num_gpus = torch.cuda.device_count()
+
+        if num_gpus == 0:
+            raise RuntimeError("NCCL backend requires at least one CUDA GPU.")
+
+        if world_size > num_gpus:
+            raise ValueError(
+                f"world_size={world_size}, but only {num_gpus} CUDA GPUs "
+                "are available on this node."
+            )
+
+        device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
 
-    
-    # run benchmark
     results = []
-    for size in message_sizes:
-        # Create tensor of specified size (in bytes, using float32 = 4 bytes)
-        num_elements = size // 4
-        tensor = torch.randn(num_elements, device=device)
-        result = benchmark_all_reduce(tensor, num_iterations)
 
-        # calc bandwidth
-        # all_reduce approximately moves 2 * size * (world_sie - 1) / world_size bytes (ring algorithm)
-        bytes_moved = 2 * size * (world_size - 1) / world_size
-        bandwidth = bytes_moved / (result['mean_ms'] / 1000)
-        results.append({
-            'size': size,
-            'num_elements': num_elements,
-            'stats': result,
-            'bandwidth': bandwidth,
-        })
+    for requested_size in message_sizes:
+        # float32 = 4 bytes per element.
+        num_elements = (requested_size + 3) // 4
+        actual_size = num_elements * 4
 
+        # Zeros avoid numerical overflow when SUM all_reduce is repeated.
+        tensor = torch.zeros(
+            num_elements,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        result = benchmark_all_reduce(
+            tensor,
+            num_iterations=num_iterations,
+        )
+
+        # Use the slowest rank's aggregate timing statistics as the reported
+        # distributed latency metrics.
+        global_mean_ms = reduce_max_across_ranks(result["mean_ms"], device)
+        global_min_ms = reduce_max_across_ranks(result["min_ms"], device)
+        global_max_ms = reduce_max_across_ranks(result["max_ms"], device)
+        global_median_ms = reduce_max_across_ranks(result["median_ms"], device)
+
+        seconds = global_mean_ms / 1000.0
+
+        # Algorithm bandwidth:
+        # tensor payload size divided by collective completion time.
+        alg_bandwidth = actual_size / seconds
+
+        # Ring-normalized bus bandwidth:
+        # Useful when comparing against the standard Ring all-reduce traffic
+        # model. It should not be interpreted as generic physical link BW for
+        # arbitrary Tree executions.
+        ring_bus_bandwidth = (
+            2.0
+            * (world_size - 1)
+            / world_size
+            * actual_size
+            / seconds
+        )
+
+        results.append(
+            {
+                "requested_size": requested_size,
+                "actual_size": actual_size,
+                "num_elements": num_elements,
+                "mean_ms": global_mean_ms,
+                "min_ms": global_min_ms,
+                "max_ms": global_max_ms,
+                "median_ms": global_median_ms,
+                "alg_bandwidth": alg_bandwidth,
+                "ring_bus_bandwidth": ring_bus_bandwidth,
+            }
+        )
+
+        # Keep different message-size experiments separated.
         dist.barrier()
 
     if rank == 0:
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 100)
         print(" ALL_REDUCE BENCHMARK RESULTS")
-        print("=" * 70)
-        print(f"Backend: {backend}")
-        print(f"World size: {world_size}")
-        print(f"Device: {device}")
-        print(f"Iterations per test: {num_iterations}")
-        print("=" * 70)
+        print("=" * 100)
+        print(f"Backend:              {backend}")
+        print(f"Algorithm:            {algorithm}")
+        print(f"World size:           {world_size}")
+        print(f"Device:               {device}")
+        print(f"Iterations per test:  {num_iterations}")
+        print("=" * 100)
 
-        print(f"\n{'Size':<12} {'Elements':<12} {'Mean (ms)':<12} {'Min (ms)':<12} {'Bandwidth':<15}")
-        print("-" * 70)
+        header = (
+            f"{'Size':<12}"
+            f"{'Elements':<14}"
+            f"{'Mean (ms)':<13}"
+            f"{'Median (ms)':<15}"
+            f"{'Min (ms)':<12}"
+            f"{'AlgBW':<16}"
+            f"{'Ring BusBW':<16}"
+        )
+
+        print("\n" + header)
+        print("-" * 100)
 
         for r in results:
-            print(f"{format_bytes(r['size']):<12} "
-                  f"{r['num_elements']:<12} "
-                  f"{r['stats']['mean_ms']:<12.3f} "
-                  f"{r['stats']['min_ms']:<12.3f} "
-                  f"{format_bandwidth(r['bandwidth']):<15}")
-
-        print("\n" + "=" * 70)
-        print(" ANALYSIS")
-        print("=" * 70)
+            print(
+                f"{format_bytes(r['actual_size']):<12}"
+                f"{r['num_elements']:<14}"
+                f"{r['mean_ms']:<13.3f}"
+                f"{r['median_ms']:<15.3f}"
+                f"{r['min_ms']:<12.3f}"
+                f"{format_bandwidth(r['alg_bandwidth']):<16}"
+                f"{format_bandwidth(r['ring_bus_bandwidth']):<16}"
+            )
 
         if len(results) >= 2:
-            # Compare small vs large messages
             small = results[0]
             large = results[-1]
 
-            small_latency = small['stats']['mean_ms']
-            large_latency = large['stats']['mean_ms']
-            size_ratio = large['size'] / small['size']
-            latency_ratio = large_latency / small_latency
+            size_ratio = large["actual_size"] / small["actual_size"]
+            latency_ratio = large["mean_ms"] / small["mean_ms"]
 
-            print(f"\nLatency scaling:")
+            print("\n" + "=" * 100)
+            print(" ANALYSIS")
+            print("=" * 100)
+
+            print("\nLatency scaling:")
             print(f"  Message size increased {size_ratio:.0f}x")
-            print(f"  Latency increased {latency_ratio:.1f}x")
-        
+            print(f"  Mean latency increased {latency_ratio:.1f}x")
+
             if latency_ratio < size_ratio * 0.5:
-                print(f"  → Latency grows sub-linearly with size (good bandwidth utilization)")
+                print(
+                    "  -> Latency grows substantially slower than message size, "
+                    "indicating improving bandwidth utilization."
+                )
             elif latency_ratio < size_ratio:
-                print(f"  → Latency grows roughly linearly with size")
+                print(
+                    "  -> Latency grows sub-linearly relative to message size."
+                )
             else:
-                print(f"  → Latency grows super-linearly (possible bottleneck)")
+                print(
+                    "  -> Latency grows at least as fast as message size; "
+                    "check for communication or topology bottlenecks."
+                )
 
-            print(f"\nBandwidth comparison:")
-            print(f"  Small messages ({format_bytes(small['size'])}): {format_bandwidth(small['bandwidth'])}")
-            print(f"  Large messages ({format_bytes(large['size'])}): {format_bandwidth(large['bandwidth'])}")
+            print("\nPayload bandwidth comparison:")
+            print(
+                f"  Small ({format_bytes(small['actual_size'])}): "
+                f"{format_bandwidth(small['alg_bandwidth'])}"
+            )
+            print(
+                f"  Large ({format_bytes(large['actual_size'])}): "
+                f"{format_bandwidth(large['alg_bandwidth'])}"
+            )
 
-            if large['bandwidth'] > small['bandwidth'] * 1.5:
-                print(f"  → Large messages achieve much better bandwidth utilization")
-                print(f"  → This is typical: large messages amortize fixed overhead")
+            if large["alg_bandwidth"] > small["alg_bandwidth"] * 1.5:
+                print(
+                    "  -> Large messages achieve substantially better "
+                    "bandwidth utilization because fixed startup costs are amortized."
+                )
 
-        print("""
-Understanding the results:
+        print(
+            """
+Interpretation:
 
-1. SMALL MESSAGES (< 1 MB):
-   - Dominated by latency (startup cost)
-   - Tree algorithm excels here (O(log N) steps)
-   - Low bandwidth utilization
+1. SMALL MESSAGES
+   - Often latency-bound.
+   - Fixed communication/setup overhead is important.
+   - Tree algorithms can perform well because communication depth is O(log N).
 
-2. LARGE MESSAGES (> 10 MB):
-   - Dominated by bandwidth
-   - Ring algorithm excels here (~100% utilization)
-   - Latency becomes less important
+2. LARGE MESSAGES
+   - Often bandwidth-bound.
+   - Fixed latency matters less relative to data-transfer time.
+   - Ring algorithms can perform well because they pipeline chunks and use
+     available links efficiently.
 
-3. NCCL AUTO-SELECTION:
-   - NCCL automatically chooses Ring or Tree based on message size
-   - Small: Tree (low latency)
-   - Large: Ring (high bandwidth)
-   - Crossover point is typically around 1-10 MB
+3. NCCL AUTO-SELECTION
+   - With --algorithm auto, NCCL chooses the communication strategy.
+   - Do not assume a universal message-size crossover between Tree and Ring.
+   - The choice depends on topology, GPU count, message size, protocol,
+     hardware, and NCCL version.
 
-4. THEORETICAL PEAK:
-   - NVLink 4.0: ~450 GB/s effective for all_reduce
-   - PCIe 4.0: ~16 GB/s effective for all_reduce
-   - If your numbers are much lower, check topology!
-""")
+4. BANDWIDTH COLUMNS
+   - AlgBW = tensor payload size / collective time.
+   - Ring BusBW applies the standard Ring all-reduce normalization factor:
+         2 * (N - 1) / N
+     It is useful as a Ring-oriented normalized metric, but should not be
+     interpreted as the actual physical bytes moved by every possible Tree
+     execution.
+
+For an explicit comparison, run the same benchmark twice:
+
+    python benchmark_algorithms.py --backend nccl --algorithm tree
+    python benchmark_algorithms.py --backend nccl --algorithm ring
+"""
+        )
 
     dist.destroy_process_group()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="NCCL Algorithm Benchmark")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="NCCL Ring/Tree All-Reduce Benchmark"
+    )
+
     parser.add_argument(
         "--sizes",
         type=str,
-        default="1000,10000,100000,1000000,10000000,100000000",
-        help="Comma-separated message sizes in bytes (default: 1KB to 100MB)"
+        default="1024,16384,262144,4194304,67108864,268435456",
+        help=(
+            "Comma-separated message sizes in bytes "
+            "(default: 1KB,16KB,256KB,4MB,64MB,256MB)"
+        ),
     )
+
     parser.add_argument(
-        "--world-size", "-w",
+        "--algorithm",
+        choices=["auto", "ring", "tree"],
+        default="auto",
+        help="NCCL algorithm selection (default: auto).",
+    )
+
+    parser.add_argument(
+        "--world-size",
+        "-w",
         type=int,
         default=4,
-        help="Number of processes (default: 4)"
+        help="Number of distributed processes (default: 4).",
     )
+
     parser.add_argument(
-        "--backend", "-b",
+        "--backend",
+        "-b",
         type=str,
         default="gloo",
         choices=["gloo", "nccl"],
-        help="Distributed backend (default: gloo for CPU compatibility)"
+        help="Distributed backend (default: gloo).",
     )
+
     parser.add_argument(
-        "--iterations", "-i",
+        "--iterations",
+        "-i",
         type=int,
         default=50,
-        help="Number of iterations per test (default: 50)"
+        help="Number of timed iterations per message size (default: 50).",
     )
 
     args = parser.parse_args()
 
-    message_sizes = [int(s) for s in args.sizes.split(',')]
+    if args.world_size < 1:
+        parser.error("--world-size must be at least 1")
 
-    print("╔" + "═" * 58 + "╗")
-    print("║" + " NCCL ALGORITHM BENCHMARK".center(58) + "║")
-    print("╚" + "═" * 58 + "╝")
-    print(f"\nMessage sizes: {[format_bytes(s) for s in message_sizes]}")
-    print(f"World size: {args.world_size}")
-    print(f"Backend: {args.backend}")
-    print(f"Iterations: {args.iterations}")
+    if args.iterations < 1:
+        parser.error("--iterations must be at least 1")
+
+    try:
+        message_sizes = [int(s.strip()) for s in args.sizes.split(",")]
+    except ValueError as exc:
+        parser.error(f"Invalid --sizes value: {exc}")
+
+    if any(size <= 0 for size in message_sizes):
+        parser.error("All message sizes must be positive integers.")
 
     if args.backend == "nccl" and not torch.cuda.is_available():
-        print("\n[WARN] NCCL backend requires CUDA. Falling back to gloo.")
+        print(
+            "\n[WARN] NCCL requires CUDA, but CUDA is unavailable. "
+            "Falling back to Gloo."
+        )
         args.backend = "gloo"
 
-    
+    if args.backend != "nccl" and args.algorithm != "auto":
+        print(
+            f"\n[WARN] --algorithm {args.algorithm} only applies to NCCL. "
+            "Gloo will ignore Ring/Tree selection."
+        )
+
+    print("╔" + "═" * 62 + "╗")
+    print("║" + " NCCL ALL_REDUCE ALGORITHM BENCHMARK".center(62) + "║")
+    print("╚" + "═" * 62 + "╝")
+
+    print(f"\nMessage sizes: {[format_bytes(s) for s in message_sizes]}")
+    print(f"World size:    {args.world_size}")
+    print(f"Backend:       {args.backend}")
+    print(f"Algorithm:     {args.algorithm}")
+    print(f"Iterations:    {args.iterations}")
+
     mp.spawn(
         benchmark_worker,
-        args=(args.world_size, message_sizes, args.backend, args.iterations),
+        args=(
+            args.world_size,
+            message_sizes,
+            args.backend,
+            args.iterations,
+            args.algorithm,
+        ),
         nprocs=args.world_size,
         join=True,
     )
+
 
 if __name__ == "__main__":
     main()
