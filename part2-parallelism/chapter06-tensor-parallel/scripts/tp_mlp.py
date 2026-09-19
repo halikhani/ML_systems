@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Tensor-Parallel MLP Block
 
@@ -7,36 +8,6 @@ the Megatron-style column→row pattern for minimal communication.
 Usage:
     python tp_mlp.py
     python tp_mlp.py --tp-size 4 --hidden-size 256
-
-            X (input)
-               │
-               ▼
-     ┌─────────────────────┐
-     │   Column-Parallel   │  ← W1 split by columns
-     │     Linear (W1)     │     No communication
-     └──────────┬──────────┘
-               │
-               ▼
-     ┌─────────────────────┐
-     │       GeLU          │  ← Local operation
-     │   (no comm needed)  │
-     └──────────┬──────────┘
-               │
-               ▼
-     ┌─────────────────────┐
-     │    Row-Parallel     │  ← W2 split by rows
-     │     Linear (W2)     │
-     └──────────┬──────────┘
-               │
-               ▼
-     ┌─────────────────────┐
-     │    all_reduce       │  ← Only sync point!
-     │                     │
-     └──────────┬──────────┘
-               │
-               ▼
-            Y (output)
-
 """
 
 import argparse
@@ -50,6 +21,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
+
 class TensorParallelMLP(nn.Module):
     """
     Tensor-parallel MLP using Megatron-style column→row parallelism.
@@ -60,9 +32,19 @@ class TensorParallelMLP(nn.Module):
     Communication: 1 all_reduce per forward pass (after row-parallel)
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int,
-                 tp_size: int, tp_rank: int, tp_group=None):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        tp_size: int,
+        tp_rank: int,
+        tp_group=None,
+        profile: bool = False,
+    ):
         super().__init__()
+        self.profile = profile
+        self.timings = {"matmul": 0.0, "gelu": 0.0, "wait": 0.0, "all_reduce": 0.0}
+
         assert intermediate_size % tp_size == 0
 
         self.hidden_size = hidden_size
@@ -73,20 +55,19 @@ class TensorParallelMLP(nn.Module):
 
         self.intermediate_local = intermediate_size // tp_size
 
-        # Column parallel: W1 shape [hidden_size, intermediate_size // tp_size]
+        # Column-parallel: W1 shape [hidden, intermediate // tp_size]
         self.w1 = nn.Linear(hidden_size, self.intermediate_local, bias=False)
 
-        # Row parallel: W2 shape [intermediate_size // tp_size, hidden_size]
+        # Row-parallel: W2 shape [intermediate // tp_size, hidden]
         self.w2 = nn.Linear(self.intermediate_local, hidden_size, bias=False)
 
         self._init_weights()
 
-    def _init_weights(self) -> None:
+    def _init_weights(self):
         """Initialize weights with proper scaling for TP."""
         nn.init.xavier_uniform_(self.w1.weight)
-        # Scale row-parallel weights to maintain variance after all_reduce
         nn.init.xavier_uniform_(self.w2.weight)
-        self.w2.weight.data /= self.tp_size
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -98,40 +79,63 @@ class TensorParallelMLP(nn.Module):
         Returns:
             Output tensor of shape [batch, seq, hidden]
         """
-        # Step 1: Column-parallel first linear (no communication)
-        h = self.w1(x)
+        if not self.profile:
+            # Step 1: Column-parallel linear
+            h = self.w1(x)
 
-        # Step 2: Activation (local)
-        h = torch.nn.functional.gelu(h)
+            # Step 2: GeLU activation (local)
+            h = torch.nn.functional.gelu(h)
 
-        # Step 3: Row-parallel second linear
-        y = self.w2(h)
+            # Step 3: Row-parallel linear
+            y = self.w2(h)
+            
+            # Step 4: All-reduce across row-parallel dimension
+            dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.tp_group)
 
-        # Step 4: All-reduce to sum partial products
-        dist.all_reduce(y, op=dist.ReduceOp.SUM, group=self.tp_group)
+            return y
+        else:
+            t0 = time.perf_counter()
+            h = self.w1(x)                      # matmul 1 (column-parallel)
+            t1 = time.perf_counter()
+            h = torch.nn.functional.gelu(h)
+            t2 = time.perf_counter()
+            y = self.w2(h)                      # matmul 2 (row-parallel)
+            t3 = time.perf_counter()
+            dist.barrier(group=self.tp_group)   # isolate load-imbalance wait from comm
+            t3b = time.perf_counter()
+            dist.all_reduce(y, group=self.tp_group)
+            t4 = time.perf_counter()
 
-        return y
+            self.timings["matmul"]     += (t1 - t0) + (t3 - t2)
+            self.timings["gelu"]       += (t2 - t1)
+            self.timings["wait"]       += (t3b - t3)
+            self.timings["all_reduce"] += (t4 - t3b)
+            return y
 
+    def reset_timings(self):
+        self.timings = {"matmul": 0.0, "gelu": 0.0, "wait": 0.0, "all_reduce": 0.0}
 
 class NonParallelMLP(nn.Module):
     """Standard MLP for comparison."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(
+        self, 
+        hidden_size: int, 
+        intermediate_size: int
+    ):
         super().__init__()
         self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
 
         nn.init.xavier_uniform_(self.w1.weight)
         nn.init.xavier_uniform_(self.w2.weight)
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = torch.nn.functional.gelu(self.w1(x))
-        return self.w2(h)
+        return self.w2(torch.nn.functional.gelu(self.w1(x)))
 
 
 def benchmark_tp_mlp(rank: int, world_size: int, hidden_size: int,
                      batch_size: int, seq_len: int, warmup: int = 10,
-                     iterations: int = 100) -> Tuple[float, float]:
+                     iterations: int = 100) -> Tuple[float, torch.Tensor, dict]:
 
     """Benchmark tensor-parallel MLP."""
     device = torch.device("cpu")
@@ -139,7 +143,7 @@ def benchmark_tp_mlp(rank: int, world_size: int, hidden_size: int,
 
     # Create TP MLP
     tp_mlp = TensorParallelMLP(
-        hidden_size, intermediate_size, world_size, rank
+        hidden_size, intermediate_size, world_size, rank, profile=True
     ).to(device)
 
     # Create input
@@ -150,16 +154,16 @@ def benchmark_tp_mlp(rank: int, world_size: int, hidden_size: int,
     for _ in range(warmup):
         _ = tp_mlp(x)
         dist.barrier()
-
+    tp_mlp.reset_timings()
     # Benchmark
     dist.barrier()
     start = time.perf_counter()
     for _ in range(iterations):
         y = tp_mlp(x)
-        dist.barrier()
     total_time = time.perf_counter() - start
 
-    return total_time / iterations, y
+    timings = {k: v / iterations for k, v in tp_mlp.timings.items()}
+    return total_time / iterations, y, timings
 
 
 def verify_correctness(rank: int, world_size: int, hidden_size: int) -> None:
@@ -176,12 +180,12 @@ def verify_correctness(rank: int, world_size: int, hidden_size: int) -> None:
     torch.manual_seed(42)
     x = torch.randn(4, 8, hidden_size, device=device)
 
-
     # Create TP MLP with deterministic weights
     torch.manual_seed(100)
     tp_mlp = TensorParallelMLP(
         hidden_size, intermediate_size, world_size, rank
     ).to(device)
+
 
     # Forward pass
     y_tp = tp_mlp(x)
@@ -190,31 +194,22 @@ def verify_correctness(rank: int, world_size: int, hidden_size: int) -> None:
     # W1 (column-parallel)
     w1_local = tp_mlp.w1.weight.data.clone()
     w1_gathered = [torch.zeros_like(w1_local) for _ in range(world_size)]
-    dist.all_gather(w1_gathered, w1_local)
+    dist.all_gather(w1_gathered, w1_local, group=tp_mlp.tp_group)
+
 
     # W2 (row-parallel)
     w2_local = tp_mlp.w2.weight.data.clone()
     w2_gathered = [torch.zeros_like(w2_local) for _ in range(world_size)]
-    dist.all_gather(w2_gathered, w2_local)
+    dist.all_gather(w2_gathered, w2_local, group=tp_mlp.tp_group)
 
     if rank == 0:
         # Reconstruct full weights
-        # NOTE: nn.Linear weights are stored in column-major order ([out, in])
-        # so we need to first cat rows (dim=0) and then transpose to get [in, out]
-        # same for W2, we need to cat columns (dim=1)
-        w1_full = torch.cat(w1_gathered, dim=0).T  # [hidden, intermediate]
-        
-        # NOTE: Each rank’s w2.weight is [hidden, intermediate_local] (PyTorch stores [out, in]).
-        # torch.cat(w2_gathered, dim=1) gives [hidden, intermediate] directly.
-        # doing the .T is equivalent to transposing the matrix for later multiplication
-        w2_full = torch.cat(w2_gathered, dim=1).T     # [intermediate, hidden]
-
-        # Correct for scaling
-        w2_full = w2_full * world_size
+        w1_full = torch.cat(w1_gathered, dim=0).T # w1 stored in torch nn.Linear as [intermediate // tp_size, hidden] -> final shape [hidden, intermediate]
+        w2_full = torch.cat(w2_gathered, dim=1) #  final shape [intermediate, hidden] as saved in nn.Linear
 
         # Compute reference output
-        h = torch.nn.functional.gelu(x @ w1_full)
-        y_ref = h @ w2_full
+        h = torch.nn.functional.gelu(x @ w1_full.T)
+        y_ref = h @ w2_full.T
 
         diff = (y_tp - y_ref).abs().max().item()
         print(f"\nInput shape: {x.shape}")
@@ -238,8 +233,6 @@ def analyze_communication(rank: int, world_size: int,
     bytes_per_allreduce = elements_per_allreduce * bytes_per_element
 
     # Ring all_reduce volume
-    # p - 1 steps of sending data, 1 for send and 1 for receive (2) and each time the data volumn is bytes_per_allreduce
-    # divide is for getting the average per GPU
     ring_volume = 2 * bytes_per_allreduce * (world_size - 1) / world_size
 
     print(f"""
@@ -297,11 +290,15 @@ Example: H=4096, T=8 (8-way TP)
 This is how we fit 70B+ parameter models on GPUs!
 """)
 
+
 def worker(rank: int, world_size: int, hidden_size: int,
            batch_size: int, seq_len: int) -> None:
     """Main worker function."""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29509"
+
+    # Avoid CPU oversubscription: split cores across ranks
+    torch.set_num_threads(max(1, os.cpu_count() // world_size))
 
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
@@ -319,15 +316,44 @@ def worker(rank: int, world_size: int, hidden_size: int,
         print(" BENCHMARK")
         print("=" * 60)
 
-    avg_time, output = benchmark_tp_mlp(
+    avg_time, output, timings = benchmark_tp_mlp(
         rank, world_size, hidden_size, batch_size, seq_len
     )
+
+    # Aggregate per-rank timings: max = slowest rank (sets step time), avg for imbalance
+    keys = ["matmul", "gelu", "wait", "all_reduce"]
+    t = torch.tensor([timings[k] for k in keys], dtype=torch.float64)
+    t_max = t.clone()
+    dist.all_reduce(t_max, op=dist.ReduceOp.MAX)
+    t_avg = t.clone()
+    dist.all_reduce(t_avg, op=dist.ReduceOp.SUM)
+    t_avg /= world_size
 
     dist.barrier()
 
     if rank == 0:
         print(f"\nTP MLP forward pass: {avg_time * 1000:.3f} ms")
         print(f"Output shape: {output.shape}")
+
+        print(f"\n{'Component':<12}{'max (ms)':>12}{'avg (ms)':>12}")
+        for k, mx, av in zip(keys, t_max.tolist(), t_avg.tolist()):
+            print(f"{k:<12}{mx * 1000:>12.3f}{av * 1000:>12.3f}")
+
+        matmul, gelu, wait, comm = t_max.tolist()
+        compute = matmul + gelu
+        total = compute + wait + comm
+        print(f"\nCompute (matmul + gelu): {compute * 1000:.3f} ms")
+        print(f"Communication (all_reduce): {comm * 1000:.3f} ms")
+        print(f"Communication %: {100 * comm / total:.1f}%  "
+              f"(incl. wait: {100 * (comm + wait) / total:.1f}%)")
+        print(f"Unaccounted overhead: {(avg_time - total) * 1000:.3f} ms")
+
+        # Sanity checks: matmul throughput and effective all_reduce bandwidth
+        intermediate_local = hidden_size * 4 // world_size
+        flops = 2 * 2 * batch_size * seq_len * hidden_size * intermediate_local
+        ring_bytes = 2 * batch_size * seq_len * hidden_size * 4 * (world_size - 1) / world_size
+        print(f"Matmul throughput: {flops / matmul / 1e9:.2f} GFLOP/s per rank")
+        print(f"All-reduce bandwidth: {ring_bytes / comm / 1e9:.3f} GB/s per rank")
 
     # Compare scaling
     compare_scaling(rank, world_size)
@@ -364,3 +390,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
