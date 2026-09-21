@@ -150,8 +150,8 @@ def calculate_communication_volume(
 
     # TP communication: all_reduce per layer
     # 2 all_reduce per transformer layer(attention + ffn)
-    tp_volume_per_layer = 4 * batch * seq * hidden * dtype * (tp_degree - 1) / tp_degree
-    # NOTE: 4 for QKV and O, batch * seq * hidden for size of activation tensor per layer
+    tp_volume_per_layer = 8 * batch * seq * hidden * dtype * (tp_degree - 1) / tp_degree
+    # NOTE: 8 = 2 (attn + ffn) * 2 (fwd + bwd) * 2 (ring all_reduce = reduce_scatter + all_gather); batch * seq * hidden * dtype is the activation tensor size
     # NOTE: (tp_degree - 1) / tp_degree is the fraction of data communication in an all_reduce across all GPUs
 
     tp_volume_total = tp_volume_per_layer * config.num_layers / pp_degree
@@ -203,9 +203,12 @@ def find_optimal_strategy(
             # mem per GPU
             params_per_gpu = mem['params'] / (tp * pp)
             grads_per_gpu = mem['gradients'] / (tp * pp)
-            optimizer_per_gpu = mem['optimizer'] / (tp * pp)  # With ZeRO-3
+            optimizer_per_gpu = mem['optimizer'] / (tp * pp)
 
-            # ZeRO-3 shards optimizer across DP
+            # ZeRO-1: shard optimizer states across DP. Comm volume is unchanged vs plain DP
+            # (reduce-scatter grads + all-gather params == all-reduce), so this is nearly free.
+            # Sharding params/grads too (ZeRO-2/3) adds cross-node traffic (DP goes over IB),
+            # which is where the NVLink-vs-IB cost matters.
             optimizer_per_gpu = optimizer_per_gpu / dp
 
             activation_mem = estimate_activation_memory(model, training, tp, pp, dp)
