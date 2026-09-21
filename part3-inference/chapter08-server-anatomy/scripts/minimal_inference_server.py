@@ -116,7 +116,7 @@ class SimpleModelRunner:
         """
         # Simulate compute time (proportional to prompt length)
         prompt_len = len(request.prompt_tokens)
-        await asyncio.sleep(self.latency_ms * prompt_len / 100)
+        await asyncio.sleep(self.latency_ms * prompt_len / 1000)
         # "Generate" first token
         first_token = random.randint(3, self.vocab_size - 1)
         return first_token
@@ -133,7 +133,7 @@ class SimpleModelRunner:
         """
 
         # Simulate compute time (roughly constant per batch)
-        await asyncio.sleep(self.latency_ms)
+        await asyncio.sleep(self.latency_ms / 1000)
 
         # Generate next tokens
         next_tokens = []
@@ -183,7 +183,7 @@ class Scheduler:
         self.running_batch = [r for r in self.running_batch if not r.is_finished]
 
         # Prefill new requests if we have capacity
-        while self.waiting_queue and len(self.running_batch) < self.max_batch_size:
+        if self.waiting_queue and len(self.running_batch) < self.max_batch_size:
             request = self.waiting_queue.popleft()
             return Batch(requests=[request], is_prefill=True)
 
@@ -263,6 +263,9 @@ class InferenceServer:
             
             tokens = await self.model_runner.prefill(request)
             self.scheduler.process_decode_result(request, tokens)
+            request.prefill_done = True
+            if not request.is_finished:
+                self.scheduler.running_batch.append(request)
 
         else:
             # Decode phase
