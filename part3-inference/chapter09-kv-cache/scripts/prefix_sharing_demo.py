@@ -52,14 +52,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 from collections import defaultdict
 
-
 @dataclass
 class RadixNode:
     """A node in the radix tree."""
     token: Optional[int] = None
-    children: Dict[int, 'RadixNode'] = field(default_factory=dict) # from token index to node
-    kv_index: Optional[int] = None  # Index into KV cache
-    ref_count: int = 0  # Number of requests using this node
+    children: Dict[int, 'RadixNode'] = field(default_factory=dict)
+    kv_index: Optional[int] = None # Index to KVC
+    ref_count: int = 0 # number of reqs using this node
 
 
 class RadixTree:
@@ -71,6 +70,7 @@ class RadixTree:
     - LRU eviction
     - Reference counting for safe deletion
     """
+
     def __init__(self):
         self.root = RadixNode()
         self.next_kv_index = 0
@@ -88,35 +88,31 @@ class RadixTree:
 
         kv_indices = []
         node = self.root
-
         for token in tokens:
-            if token not in node.children:
-                # create a new node
-                new_node = RadixNode(token=token)
+            if token in node.children:
+                # reuse node
+                self.shared_nodes += 1
+            else:
+                # new node
+                new_node = RadixNode(token)
                 new_node.kv_index = self.next_kv_index
                 self.next_kv_index += 1
                 node.children[token] = new_node
                 self.total_nodes += 1
-            else:
-                # reuse existing node (prefix sharing)
-                self.shared_nodes += 1
-
+            
             node = node.children[token]
             node.ref_count += 1
             kv_indices.append(node.kv_index)
 
         return kv_indices
 
-    
+
     def get_stats(self) -> Dict:
-        """Get statistics about the tree."""
         return {
             'total_nodes': self.total_nodes,
-            'shared_accesses': self.shared_nodes,
             'unique_kv_entries': self.next_kv_index,
+            'shared_accesses': self.shared_nodes,
         }
-
-    
 
 def visualize_tree(node: RadixNode, prefix: str = "", is_last: bool = True,
                    depth: int = 0, max_depth: int = 5) -> List[str]:
