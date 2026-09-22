@@ -50,7 +50,7 @@ Radix Tree:
 import argparse
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 @dataclass
 class RadixNode:
@@ -59,6 +59,53 @@ class RadixNode:
     children: Dict[int, 'RadixNode'] = field(default_factory=dict)
     kv_index: Optional[int] = None # Index to KVC
     ref_count: int = 0 # number of reqs using this node
+
+
+class LRUKVCache:
+    """
+    Fixed-capacity LRU cache for KV cache slots.
+
+    Slots are only evicted when ref_count == 0 (i.e. no in-flight
+    request still needs that node's KV entry) -- a pinned node can
+    be arbitrarily stale and still won't be reclaimed.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.free_slots: List[int] = list(range(capacity))
+        # kv_index -> node, ordered oldest-touched (left) to newest (right)
+        self.lru_order: 'OrderedDict[int, RadixNode]' = OrderedDict()
+        self.evictions = 0
+
+    def touch(self, node: RadixNode) -> None:
+        """Mark a resident node as most-recently-used."""
+        if node.kv_index is None:
+            return
+        self.lru_order[node.kv_index] = node
+        self.lru_order.move_to_end(node.kv_index)
+
+    def allocate(self, node: RadixNode) -> bool:
+        """
+        Assign a KV slot to `node`, evicting the LRU unreferenced
+        entry if the cache is full. Returns False if the cache is
+        full and every resident entry is still referenced (pinned).
+        """
+        if not self.free_slots and not self._evict_one():
+            return False
+
+        node.kv_index = self.free_slots.pop()
+        self.touch(node)
+        return True
+
+    def _evict_one(self) -> bool:
+        for kv_index, victim in self.lru_order.items():  # oldest first
+            if victim.ref_count == 0:
+                del self.lru_order[kv_index]
+                victim.kv_index = None
+                self.free_slots.append(kv_index)
+                self.evictions += 1
+                return True
+        return False  # everything resident is still pinned
 
 
 class RadixTree:
@@ -71,35 +118,51 @@ class RadixTree:
     - Reference counting for safe deletion
     """
 
-    def __init__(self):
+    def __init__(self, capacity: Optional[int] = None):
         self.root = RadixNode()
         self.next_kv_index = 0
         self.total_nodes = 0
         self.shared_nodes = 0
+        # capacity=None -> unbounded (original behavior, no eviction)
+        self.kv_cache = LRUKVCache(capacity) if capacity is not None else None
 
-    
+
     def insert(self, tokens: List[int]) -> List[int]:
         """
         Insert a sequence and return KV indices.
 
         Returns list of KV cache indices for each token.
-        Reuses existing indices where prefixes match.
+        Reuses existing indices where prefixes match. If an LRU
+        cache with fixed capacity is attached, evicted nodes on the
+        matched path are recomputed (new slot allocated) instead of
+        reused, mirroring a real cache miss.
         """
 
         kv_indices = []
         node = self.root
         for token in tokens:
             if token in node.children:
-                # reuse node
-                self.shared_nodes += 1
+                child = node.children[token]
+                if child.kv_index is None:
+                    # was evicted earlier -- recompute into a fresh slot
+                    if self.kv_cache is not None:
+                        self.kv_cache.allocate(child)
+                        self.next_kv_index += 1
+                else:
+                    self.shared_nodes += 1
+                    if self.kv_cache is not None:
+                        self.kv_cache.touch(child)
             else:
                 # new node
                 new_node = RadixNode(token)
-                new_node.kv_index = self.next_kv_index
+                if self.kv_cache is not None:
+                    self.kv_cache.allocate(new_node)
+                else:
+                    new_node.kv_index = self.next_kv_index
                 self.next_kv_index += 1
                 node.children[token] = new_node
                 self.total_nodes += 1
-            
+
             node = node.children[token]
             node.ref_count += 1
             kv_indices.append(node.kv_index)
@@ -107,11 +170,24 @@ class RadixTree:
         return kv_indices
 
 
+    def release(self, tokens: List[int]) -> None:
+        """
+        Decrement ref_count along a request's path once it finishes,
+        making now-unreferenced nodes eligible for LRU eviction.
+        """
+        node = self.root
+        for token in tokens:
+            node = node.children[token]
+            if node.ref_count > 0:
+                node.ref_count -= 1
+
+
     def get_stats(self) -> Dict:
         return {
             'total_nodes': self.total_nodes,
             'unique_kv_entries': self.next_kv_index,
             'shared_accesses': self.shared_nodes,
+            'evictions': self.kv_cache.evictions if self.kv_cache else 0,
         }
 
 def visualize_tree(node: RadixNode, prefix: str = "", is_last: bool = True,
@@ -135,6 +211,49 @@ def visualize_tree(node: RadixNode, prefix: str = "", is_last: bool = True,
                                    depth + 1, max_depth))
 
     return lines
+
+
+def demo_lru_eviction(capacity: int = 6):
+    """
+    Demonstrate fixed-capacity LRU eviction of KV cache slots.
+
+    Uses a small capacity so eviction is forced quickly and visible.
+    """
+    print("\n" + "=" * 70)
+    print(" LRU KV CACHE EVICTION DEMO")
+    print("=" * 70)
+    print(f"\nCapacity: {capacity} KV slots\n")
+
+    def tokenize(text: str) -> List[int]:
+        return [hash(w) % 1000 for w in text.lower().split()]
+
+    tree = RadixTree(capacity=capacity)
+
+    # Each request is issued, used, then released (finishes generating)
+    # before the next one arrives -- so its nodes become evictable.
+    requests = [
+        "you are a helpful assistant",   # 5 tokens -> fills the cache
+        "you are a coding assistant",    # shares "you are a", diverges after
+        "explain quantum computing",     # no shared prefix -> forces eviction
+    ]
+
+    for i, text in enumerate(requests):
+        tokens = tokenize(text)
+        kv_indices = tree.insert(tokens)
+        stats = tree.get_stats()
+        print(f"Request {i + 1}: \"{text}\"")
+        print(f"  KV indices: {kv_indices}")
+        print(f"  Free slots: {tree.kv_cache.free_slots}, "
+              f"evictions so far: {stats['evictions']}")
+        tree.release(tokens)  # request finished -> ref_count back to 0
+
+    print("\nFinal tree (refs should all be 0, everything released):")
+    print("\n".join(visualize_tree(tree.root)))
+
+    stats = tree.get_stats()
+    print(f"\nTotal evictions: {stats['evictions']}")
+    print(f"Total unique KV slots ever assigned: {stats['unique_kv_entries']}")
+    print(f"(cache capacity was only {capacity}, so slots were recycled)")
 
 
 def demo_prefix_sharing():
@@ -274,6 +393,8 @@ def main():
                         help="System prompt length in tokens")
     parser.add_argument("--user-prompt-len", type=int, default=100,
                         help="Average user prompt length")
+    parser.add_argument("--lru-capacity", type=int, default=6,
+                        help="KV slot capacity for the LRU eviction demo")
     args = parser.parse_args()
 
     print("╔" + "═" * 68 + "╗")
@@ -303,6 +424,9 @@ def main():
         query_len=50,
         kv_bytes_per_token=kv_bytes
     )
+
+    # LRU eviction demo (Exercise 3)
+    demo_lru_eviction(capacity=args.lru_capacity)
 
     # Key insights
     print("\n" + "=" * 70)
